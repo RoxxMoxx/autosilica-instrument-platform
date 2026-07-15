@@ -1,0 +1,19 @@
+[package]
+name = "api"
+description = "Interface layer: Axum REST API, routes, handlers and HTTP-specific error mapping. Depends on application and domain."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+domain = { path = "../domain" }
+application = { path = "../application" }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }

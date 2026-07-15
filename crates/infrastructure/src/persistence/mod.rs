@@ -1,0 +1,3 @@
+mod in_memory_instrument_repository;
+
+pub use in_memory_instrument_repository::InMemoryInstrumentRepository;

@@ -1,0 +1,19 @@
+[package]
+name = "infrastructure"
+description = "Infrastructure layer: configuration loading, logging setup, and repository adapters implementing domain ports."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+domain = { path = "../domain" }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+config = { workspace = true }
+dotenvy = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+libloading = { workspace = true }

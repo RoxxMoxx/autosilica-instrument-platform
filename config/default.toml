@@ -1,0 +1,10 @@
+# Base configuration, always loaded first.
+# Overridden by config/{development,production}.toml and then by
+# AUTOSILICA__* environment variables (see .env.example).
+
+[server]
+host = "0.0.0.0"
+port = 8080
+
+[logging]
+level = "info"

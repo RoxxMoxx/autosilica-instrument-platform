@@ -1,0 +1,15 @@
+[package]
+name = "application"
+description = "Application layer: use cases (interactors), DTOs and application-level errors. Depends only on the domain layer."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+domain = { path = "../domain" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }

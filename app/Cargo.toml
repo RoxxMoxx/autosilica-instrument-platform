@@ -1,0 +1,22 @@
+[package]
+name = "autosilica-server"
+description = "Composition root: wires domain, application, infrastructure and api crates together and runs the HTTP server."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "autosilica-server"
+path = "src/main.rs"
+
+[dependencies]
+domain = { path = "../crates/domain" }
+application = { path = "../crates/application" }
+infrastructure = { path = "../crates/infrastructure" }
+api = { path = "../crates/api" }
+axum = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+dotenvy = { workspace = true }
