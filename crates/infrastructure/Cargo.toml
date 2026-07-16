@@ -17,3 +17,4 @@ dotenvy = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 libloading = { workspace = true }
+chrono = { workspace = true }

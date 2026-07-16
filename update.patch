@@ -1,0 +1,871 @@
+diff --git a/app/src/main.rs b/app/src/main.rs
+index 2b9c667..3f52dfe 100644
+--- a/app/src/main.rs
++++ b/app/src/main.rs
+@@ -5,26 +5,34 @@
+ //! injects them into application use cases, and hands everything to
+ //! the `api` layer to build and serve the Axum router.
+ //!
+-//! Instrument *communication* (SCPI execution, measurements, etc.) is
+-//! NOT implemented here. `infrastructure` currently ships an
+-//! in-memory `InstrumentRepository` and a VISA-backed
+-//! `InstrumentDiscoveryPort` (resource enumeration + `*IDN?` only); a
+-//! real driver/adapter layer will be added in a future iteration
+-//! without requiring changes to `domain`, `application` or `api`.
++//! Instrument *communication* beyond discovery and pooled connection
++//! management (SCPI execution, measurements, etc.) is NOT implemented
++//! here. `infrastructure` currently ships an in-memory
++//! `InstrumentRepository`, a VISA-backed `InstrumentDiscoveryPort`
++//! (resource enumeration + `*IDN?` only), and a VISA-backed
++//! `ConnectionManagerPort` (persistent, pooled sessions with
++//! heartbeat + auto-reconnect); a real command/measurement layer will
++//! be added in a future iteration without requiring changes to
++//! `domain`, `application` or `api`.
+ 
+ use std::net::SocketAddr;
+ use std::sync::Arc;
++use std::time::Duration;
+ 
++use application::use_cases::connection::{
++    ConnectInstrumentUseCase, DisconnectInstrumentUseCase, ListConnectionsUseCase,
++};
+ use application::use_cases::discovery::DiscoverInstrumentsUseCase;
+ use application::use_cases::instrument::{
+     GetInstrumentUseCase, ListInstrumentsUseCase, RegisterInstrumentUseCase,
+ };
++use domain::connection::ConnectionManagerPort;
+ use domain::discovery::InstrumentDiscoveryPort;
+ use domain::repositories::InstrumentRepository;
+ use infrastructure::config::Settings;
+ use infrastructure::logging::init_tracing;
+ use infrastructure::persistence::InMemoryInstrumentRepository;
+-use infrastructure::visa::NiVisaDiscoveryBackend;
++use infrastructure::visa::{NiVisaDiscoveryBackend, VisaConnectionManager};
+ 
+ use api::routes::create_router;
+ use api::state::AppState;
+@@ -46,11 +54,18 @@ async fn main() -> anyhow::Result<()> {
+     let repository: Arc<dyn InstrumentRepository> = Arc::new(InMemoryInstrumentRepository::new());
+     let discovery: Arc<dyn InstrumentDiscoveryPort> = Arc::new(NiVisaDiscoveryBackend::new());
+ 
++    let connection_manager = Arc::new(VisaConnectionManager::new(Duration::from_secs(15)));
++    connection_manager.spawn_heartbeat();
++    let connections: Arc<dyn ConnectionManagerPort> = connection_manager;
++
+     let state = AppState {
+         list_instruments: Arc::new(ListInstrumentsUseCase::new(repository.clone())),
+         get_instrument: Arc::new(GetInstrumentUseCase::new(repository.clone())),
+         register_instrument: Arc::new(RegisterInstrumentUseCase::new(repository.clone())),
+         discover_instruments: Arc::new(DiscoverInstrumentsUseCase::new(discovery)),
++        connect_instrument: Arc::new(ConnectInstrumentUseCase::new(connections.clone())),
++        disconnect_instrument: Arc::new(DisconnectInstrumentUseCase::new(connections.clone())),
++        list_connections: Arc::new(ListConnectionsUseCase::new(connections)),
+     };
+ 
+     let app = create_router(state);
+diff --git a/crates/api/src/handlers/connection_handler.rs b/crates/api/src/handlers/connection_handler.rs
+new file mode 100644
+index 0000000..7d63def
+--- /dev/null
++++ b/crates/api/src/handlers/connection_handler.rs
+@@ -0,0 +1,30 @@
++use axum::extract::State;
++use axum::Json;
++
++use application::dto::{ConnectionRequest, ConnectionResponse};
++
++use crate::error_response::ApiError;
++use crate::state::AppState;
++
++pub async fn connect(
++    State(state): State<AppState>,
++    Json(payload): Json<ConnectionRequest>,
++) -> Result<Json<ConnectionResponse>, ApiError> {
++    let connection = state.connect_instrument.execute(&payload.resource).await?;
++    Ok(Json(connection))
++}
++
++pub async fn disconnect(
++    State(state): State<AppState>,
++    Json(payload): Json<ConnectionRequest>,
++) -> Result<Json<ConnectionResponse>, ApiError> {
++    let connection = state.disconnect_instrument.execute(&payload.resource).await?;
++    Ok(Json(connection))
++}
++
++pub async fn list_connections(
++    State(state): State<AppState>,
++) -> Result<Json<Vec<ConnectionResponse>>, ApiError> {
++    let connections = state.list_connections.execute().await?;
++    Ok(Json(connections))
++}
+diff --git a/crates/api/src/handlers/mod.rs b/crates/api/src/handlers/mod.rs
+index bb5d3ba..9d0414d 100644
+--- a/crates/api/src/handlers/mod.rs
++++ b/crates/api/src/handlers/mod.rs
+@@ -1,5 +1,7 @@
++mod connection_handler;
+ mod discovery_handler;
+ mod instrument_handler;
+ 
++pub use connection_handler::{connect, disconnect, list_connections};
+ pub use discovery_handler::discover_instruments;
+ pub use instrument_handler::{get_instrument, list_instruments, register_instrument};
+diff --git a/crates/api/src/routes/connections.rs b/crates/api/src/routes/connections.rs
+new file mode 100644
+index 0000000..c37aeff
+--- /dev/null
++++ b/crates/api/src/routes/connections.rs
+@@ -0,0 +1,12 @@
++use axum::routing::{get, post};
++use axum::Router;
++
++use crate::handlers::{connect, disconnect, list_connections};
++use crate::state::AppState;
++
++pub fn routes() -> Router<AppState> {
++    Router::new()
++        .route("/connect", post(connect))
++        .route("/disconnect", post(disconnect))
++        .route("/connections", get(list_connections))
++}
+diff --git a/crates/api/src/routes/mod.rs b/crates/api/src/routes/mod.rs
+index add8bea..cc0246d 100644
+--- a/crates/api/src/routes/mod.rs
++++ b/crates/api/src/routes/mod.rs
+@@ -1,3 +1,4 @@
++mod connections;
+ mod discovery;
+ mod health;
+ mod instruments;
+@@ -11,7 +12,9 @@ use crate::state::AppState;
+ /// Builds the top-level Axum router, mounting all route groups and
+ /// shared middleware.
+ pub fn create_router(state: AppState) -> Router {
+-    let api_v1 = instruments::routes().merge(discovery::routes());
++    let api_v1 = instruments::routes()
++        .merge(discovery::routes())
++        .merge(connections::routes());
+ 
+     Router::new()
+         .merge(health::routes())
+diff --git a/crates/api/src/state.rs b/crates/api/src/state.rs
+index 29621a5..177afc2 100644
+--- a/crates/api/src/state.rs
++++ b/crates/api/src/state.rs
+@@ -1,5 +1,8 @@
+ use std::sync::Arc;
+ 
++use application::use_cases::connection::{
++    ConnectInstrumentUseCase, DisconnectInstrumentUseCase, ListConnectionsUseCase,
++};
+ use application::use_cases::discovery::DiscoverInstrumentsUseCase;
+ use application::use_cases::instrument::{
+     GetInstrumentUseCase, ListInstrumentsUseCase, RegisterInstrumentUseCase,
+@@ -16,4 +19,7 @@ pub struct AppState {
+     pub get_instrument: Arc<GetInstrumentUseCase>,
+     pub register_instrument: Arc<RegisterInstrumentUseCase>,
+     pub discover_instruments: Arc<DiscoverInstrumentsUseCase>,
++    pub connect_instrument: Arc<ConnectInstrumentUseCase>,
++    pub disconnect_instrument: Arc<DisconnectInstrumentUseCase>,
++    pub list_connections: Arc<ListConnectionsUseCase>,
+ }
+diff --git a/crates/application/src/dto/connection_dto.rs b/crates/application/src/dto/connection_dto.rs
+new file mode 100644
+index 0000000..53e43fd
+--- /dev/null
++++ b/crates/application/src/dto/connection_dto.rs
+@@ -0,0 +1,43 @@
++use serde::{Deserialize, Serialize};
++
++use domain::connection::{Connection, ConnectionState};
++
++/// Wire format for connection records returned by `/connect`,
++/// `/disconnect` and `/connections`.
++#[derive(Debug, Clone, Serialize)]
++pub struct ConnectionResponse {
++    pub resource: String,
++    pub state: String,
++    pub connected_at: Option<String>,
++    pub last_heartbeat_at: Option<String>,
++    pub retry_count: u32,
++    pub last_error: Option<String>,
++}
++
++impl From<Connection> for ConnectionResponse {
++    fn from(connection: Connection) -> Self {
++        Self {
++            resource: connection.resource,
++            state: state_to_str(connection.state).to_string(),
++            connected_at: connection.connected_at.map(|t| t.to_rfc3339()),
++            last_heartbeat_at: connection.last_heartbeat_at.map(|t| t.to_rfc3339()),
++            retry_count: connection.retry_count,
++            last_error: connection.last_error,
++        }
++    }
++}
++
++fn state_to_str(state: ConnectionState) -> &'static str {
++    match state {
++        ConnectionState::Connected => "connected",
++        ConnectionState::Disconnected => "disconnected",
++        ConnectionState::Busy => "busy",
++        ConnectionState::Error => "error",
++    }
++}
++
++/// Request body for `POST /api/v1/connect` and `POST /api/v1/disconnect`.
++#[derive(Debug, Clone, Deserialize)]
++pub struct ConnectionRequest {
++    pub resource: String,
++}
+diff --git a/crates/application/src/dto/mod.rs b/crates/application/src/dto/mod.rs
+index d2c3e4a..3b72fb5 100644
+--- a/crates/application/src/dto/mod.rs
++++ b/crates/application/src/dto/mod.rs
+@@ -1,5 +1,7 @@
++mod connection_dto;
+ mod discovery_dto;
+ mod instrument_dto;
+ 
++pub use connection_dto::{ConnectionRequest, ConnectionResponse};
+ pub use discovery_dto::DiscoveredInstrumentResponse;
+ pub use instrument_dto::{InstrumentResponse, RegisterInstrumentRequest};
+diff --git a/crates/application/src/use_cases/connection/connect_instrument.rs b/crates/application/src/use_cases/connection/connect_instrument.rs
+new file mode 100644
+index 0000000..bc820a5
+--- /dev/null
++++ b/crates/application/src/use_cases/connection/connect_instrument.rs
+@@ -0,0 +1,29 @@
++use std::sync::Arc;
++
++use domain::connection::ConnectionManagerPort;
++
++use crate::dto::ConnectionResponse;
++use crate::errors::ApplicationError;
++
++/// Use case: connect to a VISA resource, reusing an existing pooled
++/// connection when one is already open.
++pub struct ConnectInstrumentUseCase {
++    manager: Arc<dyn ConnectionManagerPort>,
++}
++
++impl ConnectInstrumentUseCase {
++    pub fn new(manager: Arc<dyn ConnectionManagerPort>) -> Self {
++        Self { manager }
++    }
++
++    pub async fn execute(&self, resource: &str) -> Result<ConnectionResponse, ApplicationError> {
++        if resource.trim().is_empty() {
++            return Err(ApplicationError::InvalidInput(
++                "resource must not be empty".into(),
++            ));
++        }
++
++        let connection = self.manager.connect(resource).await?;
++        Ok(connection.into())
++    }
++}
+diff --git a/crates/application/src/use_cases/connection/disconnect_instrument.rs b/crates/application/src/use_cases/connection/disconnect_instrument.rs
+new file mode 100644
+index 0000000..64521c4
+--- /dev/null
++++ b/crates/application/src/use_cases/connection/disconnect_instrument.rs
+@@ -0,0 +1,28 @@
++use std::sync::Arc;
++
++use domain::connection::ConnectionManagerPort;
++
++use crate::dto::ConnectionResponse;
++use crate::errors::ApplicationError;
++
++/// Use case: disconnect a pooled connection to a VISA resource.
++pub struct DisconnectInstrumentUseCase {
++    manager: Arc<dyn ConnectionManagerPort>,
++}
++
++impl DisconnectInstrumentUseCase {
++    pub fn new(manager: Arc<dyn ConnectionManagerPort>) -> Self {
++        Self { manager }
++    }
++
++    pub async fn execute(&self, resource: &str) -> Result<ConnectionResponse, ApplicationError> {
++        if resource.trim().is_empty() {
++            return Err(ApplicationError::InvalidInput(
++                "resource must not be empty".into(),
++            ));
++        }
++
++        let connection = self.manager.disconnect(resource).await?;
++        Ok(connection.into())
++    }
++}
+diff --git a/crates/application/src/use_cases/connection/list_connections.rs b/crates/application/src/use_cases/connection/list_connections.rs
+new file mode 100644
+index 0000000..15cb8be
+--- /dev/null
++++ b/crates/application/src/use_cases/connection/list_connections.rs
+@@ -0,0 +1,22 @@
++use std::sync::Arc;
++
++use domain::connection::ConnectionManagerPort;
++
++use crate::dto::ConnectionResponse;
++use crate::errors::ApplicationError;
++
++/// Use case: list every connection currently tracked by the pool.
++pub struct ListConnectionsUseCase {
++    manager: Arc<dyn ConnectionManagerPort>,
++}
++
++impl ListConnectionsUseCase {
++    pub fn new(manager: Arc<dyn ConnectionManagerPort>) -> Self {
++        Self { manager }
++    }
++
++    pub async fn execute(&self) -> Result<Vec<ConnectionResponse>, ApplicationError> {
++        let connections = self.manager.list().await?;
++        Ok(connections.into_iter().map(Into::into).collect())
++    }
++}
+diff --git a/crates/application/src/use_cases/connection/mod.rs b/crates/application/src/use_cases/connection/mod.rs
+new file mode 100644
+index 0000000..cda11cb
+--- /dev/null
++++ b/crates/application/src/use_cases/connection/mod.rs
+@@ -0,0 +1,7 @@
++mod connect_instrument;
++mod disconnect_instrument;
++mod list_connections;
++
++pub use connect_instrument::ConnectInstrumentUseCase;
++pub use disconnect_instrument::DisconnectInstrumentUseCase;
++pub use list_connections::ListConnectionsUseCase;
+diff --git a/crates/application/src/use_cases/mod.rs b/crates/application/src/use_cases/mod.rs
+index 8638261..1f537d6 100644
+--- a/crates/application/src/use_cases/mod.rs
++++ b/crates/application/src/use_cases/mod.rs
+@@ -1,2 +1,3 @@
++pub mod connection;
+ pub mod discovery;
+ pub mod instrument;
+diff --git a/crates/domain/src/connection/connection.rs b/crates/domain/src/connection/connection.rs
+new file mode 100644
+index 0000000..09cbbfb
+--- /dev/null
++++ b/crates/domain/src/connection/connection.rs
+@@ -0,0 +1,42 @@
++use chrono::{DateTime, Utc};
++use serde::{Deserialize, Serialize};
++
++/// Lifecycle state of a pooled connection.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum ConnectionState {
++    /// A live, idle session is open and ready for use.
++    Connected,
++    /// No session is currently open for this resource.
++    Disconnected,
++    /// A session is open but momentarily occupied (e.g. a heartbeat
++    /// or command is in flight).
++    Busy,
++    /// The most recent connect/reconnect attempt failed.
++    Error,
++}
++
++/// Point-in-time record of a pooled connection to a VISA resource.
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct Connection {
++    pub resource: String,
++    pub state: ConnectionState,
++    pub connected_at: Option<DateTime<Utc>>,
++    pub last_heartbeat_at: Option<DateTime<Utc>>,
++    pub retry_count: u32,
++    pub last_error: Option<String>,
++}
++
++impl Connection {
++    /// A fresh, never-connected record for `resource`.
++    pub fn disconnected(resource: impl Into<String>) -> Self {
++        Self {
++            resource: resource.into(),
++            state: ConnectionState::Disconnected,
++            connected_at: None,
++            last_heartbeat_at: None,
++            retry_count: 0,
++            last_error: None,
++        }
++    }
++}
+diff --git a/crates/domain/src/connection/mod.rs b/crates/domain/src/connection/mod.rs
+new file mode 100644
+index 0000000..d9be2de
+--- /dev/null
++++ b/crates/domain/src/connection/mod.rs
+@@ -0,0 +1,13 @@
++//! Instrument connection-pool bounded context.
++//!
++//! Models persistent, reusable connections to VISA resources and the
++//! states they move through (`Connected`, `Disconnected`, `Busy`,
++//! `Error`). Distinct from `discovery` (which only enumerates and
++//! `*IDN?`-queries resources) and from the registered-`Instrument`
++//! context.
++
++mod connection;
++mod port;
++
++pub use connection::{Connection, ConnectionState};
++pub use port::ConnectionManagerPort;
+diff --git a/crates/domain/src/connection/port.rs b/crates/domain/src/connection/port.rs
+new file mode 100644
+index 0000000..ce27ec2
+--- /dev/null
++++ b/crates/domain/src/connection/port.rs
+@@ -0,0 +1,28 @@
++use async_trait::async_trait;
++
++use crate::errors::DomainError;
++
++use super::Connection;
++
++/// Port for the instrument connection pool.
++///
++/// Implemented by an infrastructure adapter that holds real,
++/// persistent connections (e.g. open VISA sessions) and reuses them
++/// across calls rather than opening a new one every time.
++#[async_trait]
++pub trait ConnectionManagerPort: Send + Sync {
++    /// Connects to `resource`, reusing an already-open connection if
++    /// one exists. Returns the resulting [`Connection`] record even
++    /// when the underlying attempt failed (state `Error` in that
++    /// case) — a failed connect is a normal, representable outcome,
++    /// not an application-level error.
++    async fn connect(&self, resource: &str) -> Result<Connection, DomainError>;
++
++    /// Disconnects `resource`, closing its underlying connection if
++    /// open. Fails with `DomainError::NotFound` if `resource` is not
++    /// currently tracked by the pool.
++    async fn disconnect(&self, resource: &str) -> Result<Connection, DomainError>;
++
++    /// Lists every connection currently tracked by the pool.
++    async fn list(&self) -> Result<Vec<Connection>, DomainError>;
++}
+diff --git a/crates/domain/src/lib.rs b/crates/domain/src/lib.rs
+index 8b64ebd..abff2d8 100644
+--- a/crates/domain/src/lib.rs
++++ b/crates/domain/src/lib.rs
+@@ -8,6 +8,7 @@
+ //! of persistence, HTTP, configuration or instrument communication.
+ //! It must never depend on `application`, `infrastructure` or `api`.
+ 
++pub mod connection;
+ pub mod discovery;
+ pub mod entities;
+ pub mod errors;
+diff --git a/crates/infrastructure/Cargo.toml b/crates/infrastructure/Cargo.toml
+index 1078652..2856639 100644
+--- a/crates/infrastructure/Cargo.toml
++++ b/crates/infrastructure/Cargo.toml
+@@ -17,3 +17,4 @@ dotenvy = { workspace = true }
+ serde = { workspace = true }
+ tokio = { workspace = true }
+ libloading = { workspace = true }
++chrono = { workspace = true }
+diff --git a/crates/infrastructure/src/visa/connection_backend.rs b/crates/infrastructure/src/visa/connection_backend.rs
+new file mode 100644
+index 0000000..279151e
+--- /dev/null
++++ b/crates/infrastructure/src/visa/connection_backend.rs
+@@ -0,0 +1,371 @@
++use std::collections::HashMap;
++use std::ffi::CString;
++use std::sync::{Arc, OnceLock};
++use std::time::Duration;
++
++use async_trait::async_trait;
++use chrono::Utc;
++use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock};
++use tracing::{debug, info, warn};
++
++use domain::connection::{Connection, ConnectionManagerPort, ConnectionState};
++use domain::errors::DomainError;
++
++use super::bindings::*;
++use super::library::VisaApi;
++
++/// One pooled resource: its domain-level state plus (when open) the
++/// raw VISA session handle backing it.
++struct PoolEntry {
++    connection: Connection,
++    /// Open VISA instrument session, present only while a session is
++    /// actually held open (state `Connected` or transiently `Busy`).
++    session: Option<ViSession>,
++}
++
++/// `ConnectionManagerPort` adapter backed by a dynamically-loaded
++/// VISA shared library, holding **persistent** per-resource sessions
++/// — unlike `discovery_backend`, which opens and immediately closes a
++/// session for a single `*IDN?` query, this keeps sessions open and
++/// reuses them across calls.
++///
++/// Thread-safety: all mutable state lives behind `tokio::sync`
++/// primitives (`RwLock` for the pool map, `Mutex` for the shared
++/// resource-manager session), so the manager is safely shared as
++/// `Arc<dyn ConnectionManagerPort>` across HTTP handlers and the
++/// background heartbeat task.
++pub struct VisaConnectionManager {
++    api: OnceLock<Option<Arc<VisaApi>>>,
++    /// Persistent VISA default resource-manager session, opened
++    /// lazily on first use and reused for every `viOpen` call.
++    rm_session: TokioMutex<Option<ViSession>>,
++    pool: TokioRwLock<HashMap<String, PoolEntry>>,
++    heartbeat_interval: Duration,
++}
++
++impl VisaConnectionManager {
++    pub fn new(heartbeat_interval: Duration) -> Self {
++        Self {
++            api: OnceLock::new(),
++            rm_session: TokioMutex::new(None),
++            pool: TokioRwLock::new(HashMap::new()),
++            heartbeat_interval,
++        }
++    }
++
++    /// Spawns a background Tokio task that periodically runs a
++    /// heartbeat pass over the pool. Call once, after wrapping the
++    /// manager in an `Arc`.
++    pub fn spawn_heartbeat(self: &Arc<Self>) {
++        let manager = Arc::clone(self);
++        let interval = manager.heartbeat_interval;
++        tokio::spawn(async move {
++            let mut ticker = tokio::time::interval(interval);
++            // The first tick fires immediately; skip it so we don't
++            // heartbeat an empty pool the instant the server starts.
++            ticker.tick().await;
++            loop {
++                ticker.tick().await;
++                manager.run_heartbeat_once().await;
++            }
++        });
++    }
++
++    fn api(&self) -> Option<Arc<VisaApi>> {
++        self.api
++            .get_or_init(|| match VisaApi::load() {
++                Ok(api) => Some(Arc::new(api)),
++                Err(err) => {
++                    warn!(
++                        error = %err,
++                        "no VISA runtime available; connections will fail to open"
++                    );
++                    None
++                }
++            })
++            .clone()
++    }
++
++    async fn resource_manager_session(&self, api: &VisaApi) -> Result<ViSession, DomainError> {
++        let mut guard = self.rm_session.lock().await;
++        if let Some(session) = *guard {
++            return Ok(session);
++        }
++
++        let mut session: ViSession = 0;
++        // SAFETY: `session` is a valid, uniquely-owned out-pointer.
++        let status = unsafe { (api.open_default_rm)(&mut session) };
++        if status < VI_SUCCESS {
++            return Err(DomainError::Validation(format!(
++                "viOpenDefaultRM failed with status {status}"
++            )));
++        }
++
++        *guard = Some(session);
++        Ok(session)
++    }
++
++    /// Opens a fresh VISA session to `resource`.
++    async fn open_resource(&self, resource: &str) -> Result<ViSession, String> {
++        let api = self
++            .api()
++            .ok_or_else(|| "no VISA runtime available".to_string())?;
++        let rm = self
++            .resource_manager_session(&api)
++            .await
++            .map_err(|e| e.to_string())?;
++
++        let resource_c =
++            CString::new(resource).map_err(|_| "invalid resource string".to_string())?;
++        let mut instrument: ViSession = 0;
++        // SAFETY: `resource_c` is valid and NUL-terminated for the
++        // duration of this call; `instrument` is a uniquely-owned
++        // out-pointer.
++        let status = unsafe {
++            (api.open)(
++                rm,
++                resource_c.as_ptr(),
++                VI_NULL,
++                VI_OPEN_TIMEOUT_MS,
++                &mut instrument,
++            )
++        };
++        if status < VI_SUCCESS {
++            return Err(format!("viOpen failed with status {status}"));
++        }
++
++        Ok(instrument)
++    }
++
++    fn close_resource(&self, api: &VisaApi, session: ViSession) {
++        // SAFETY: `session` is a valid session handle being
++        // relinquished by this call.
++        unsafe {
++            (api.close)(session);
++        }
++    }
++
++    /// Sends `*IDN?` on an already-open session and confirms a
++    /// response is received, as a lightweight liveness check.
++    fn ping(&self, api: &VisaApi, session: ViSession) -> Result<(), String> {
++        const QUERY: &[u8] = b"*IDN?\n";
++
++        let mut written: ViUInt32 = 0;
++        // SAFETY: `QUERY` is a valid buffer for its given length;
++        // `written` is a uniquely-owned out-pointer.
++        let status = unsafe {
++            (api.write)(
++                session,
++                QUERY.as_ptr(),
++                QUERY.len() as ViUInt32,
++                &mut written,
++            )
++        };
++        if status < VI_SUCCESS {
++            return Err(format!("viWrite failed with status {status}"));
++        }
++
++        let mut buffer = [0u8; 512];
++        let mut read: ViUInt32 = 0;
++        // SAFETY: `buffer` is a valid, uniquely-owned buffer of the
++        // given capacity; `read` is a uniquely-owned out-pointer.
++        let status =
++            unsafe { (api.read)(session, buffer.as_mut_ptr(), buffer.len() as ViUInt32, &mut read) };
++        if status < VI_SUCCESS {
++            return Err(format!("viRead failed with status {status}"));
++        }
++
++        Ok(())
++    }
++
++    /// Runs one heartbeat pass: pings every `Connected` resource
++    /// (auto-reconnecting on failure) and retries every
++    /// `Disconnected` resource still tracked by the pool.
++    async fn run_heartbeat_once(&self) {
++        let Some(api) = self.api() else {
++            return;
++        };
++
++        let (connected, disconnected): (Vec<String>, Vec<String>) = {
++            let pool = self.pool.read().await;
++            let connected = pool
++                .iter()
++                .filter(|(_, e)| e.connection.state == ConnectionState::Connected)
++                .map(|(resource, _)| resource.clone())
++                .collect();
++            let disconnected = pool
++                .iter()
++                .filter(|(_, e)| e.connection.state == ConnectionState::Disconnected)
++                .map(|(resource, _)| resource.clone())
++                .collect();
++            (connected, disconnected)
++        };
++
++        for resource in connected {
++            self.heartbeat_connected(&api, &resource).await;
++        }
++        for resource in disconnected {
++            self.attempt_reconnect(&api, &resource, "scheduled auto-reconnect")
++                .await;
++        }
++    }
++
++    async fn heartbeat_connected(&self, api: &VisaApi, resource: &str) {
++        let session = {
++            let mut pool = self.pool.write().await;
++            let Some(entry) = pool.get_mut(resource) else {
++                return;
++            };
++            let Some(session) = entry.session else {
++                return;
++            };
++            entry.connection.state = ConnectionState::Busy;
++            session
++        };
++
++        match self.ping(api, session) {
++            Ok(()) => {
++                let mut pool = self.pool.write().await;
++                if let Some(entry) = pool.get_mut(resource) {
++                    entry.connection.state = ConnectionState::Connected;
++                    entry.connection.last_heartbeat_at = Some(Utc::now());
++                    entry.connection.retry_count = 0;
++                    entry.connection.last_error = None;
++                }
++                debug!(resource, "heartbeat ok");
++            }
++            Err(err) => {
++                warn!(resource, error = %err, "heartbeat failed");
++                self.attempt_reconnect(api, resource, "heartbeat failure")
++                    .await;
++            }
++        }
++    }
++
++    /// Closes any stale handle for `resource` and attempts to open a
++    /// fresh session, updating pool state accordingly.
++    async fn attempt_reconnect(&self, api: &VisaApi, resource: &str, reason: &str) {
++        {
++            let mut pool = self.pool.write().await;
++            let Some(entry) = pool.get_mut(resource) else {
++                return;
++            };
++            if let Some(session) = entry.session.take() {
++                self.close_resource(api, session);
++            }
++        }
++
++        match self.open_resource(resource).await {
++            Ok(session) => {
++                let mut pool = self.pool.write().await;
++                if let Some(entry) = pool.get_mut(resource) {
++                    entry.session = Some(session);
++                    entry.connection.state = ConnectionState::Connected;
++                    entry.connection.last_heartbeat_at = Some(Utc::now());
++                    entry.connection.retry_count = 0;
++                    entry.connection.last_error = None;
++                }
++                info!(resource, reason, "auto-reconnected");
++            }
++            Err(err) => {
++                let mut pool = self.pool.write().await;
++                if let Some(entry) = pool.get_mut(resource) {
++                    entry.connection.state = ConnectionState::Disconnected;
++                    entry.connection.retry_count += 1;
++                    entry.connection.last_error = Some(err.clone());
++                }
++                warn!(resource, reason, error = %err, "auto-reconnect failed");
++            }
++        }
++    }
++}
++
++#[async_trait]
++impl ConnectionManagerPort for VisaConnectionManager {
++    async fn connect(&self, resource: &str) -> Result<Connection, DomainError> {
++        // Fast path: reuse an already-open connection.
++        {
++            let pool = self.pool.read().await;
++            if let Some(entry) = pool.get(resource) {
++                if entry.connection.state == ConnectionState::Connected {
++                    debug!(resource, "reusing existing connection");
++                    return Ok(entry.connection.clone());
++                }
++            }
++        }
++
++        match self.open_resource(resource).await {
++            Ok(session) => {
++                let now = Utc::now();
++                let connection = Connection {
++                    resource: resource.to_string(),
++                    state: ConnectionState::Connected,
++                    connected_at: Some(now),
++                    last_heartbeat_at: Some(now),
++                    retry_count: 0,
++                    last_error: None,
++                };
++
++                let mut pool = self.pool.write().await;
++                pool.insert(
++                    resource.to_string(),
++                    PoolEntry {
++                        connection: connection.clone(),
++                        session: Some(session),
++                    },
++                );
++                info!(resource, "connected");
++                Ok(connection)
++            }
++            Err(err) => {
++                let mut pool = self.pool.write().await;
++                let previous_retries =
++                    pool.get(resource).map(|e| e.connection.retry_count).unwrap_or(0);
++                let connection = Connection {
++                    resource: resource.to_string(),
++                    state: ConnectionState::Error,
++                    connected_at: None,
++                    last_heartbeat_at: None,
++                    retry_count: previous_retries + 1,
++                    last_error: Some(err.clone()),
++                };
++                pool.insert(
++                    resource.to_string(),
++                    PoolEntry {
++                        connection: connection.clone(),
++                        session: None,
++                    },
++                );
++                warn!(resource, error = %err, "connect failed");
++                Ok(connection)
++            }
++        }
++    }
++
++    async fn disconnect(&self, resource: &str) -> Result<Connection, DomainError> {
++        let mut pool = self.pool.write().await;
++        let Some(entry) = pool.get_mut(resource) else {
++            return Err(DomainError::NotFound(resource.to_string()));
++        };
++
++        if let (Some(api), Some(session)) = (self.api(), entry.session.take()) {
++            self.close_resource(&api, session);
++        }
++
++        entry.connection.state = ConnectionState::Disconnected;
++        entry.connection.connected_at = None;
++        entry.connection.last_error = None;
++        entry.connection.retry_count = 0;
++
++        info!(resource, "disconnected");
++        Ok(entry.connection.clone())
++    }
++
++    async fn list(&self) -> Result<Vec<Connection>, DomainError> {
++        let pool = self.pool.read().await;
++        let mut connections: Vec<Connection> =
++            pool.values().map(|entry| entry.connection.clone()).collect();
++        connections.sort_by(|a, b| a.resource.cmp(&b.resource));
++        Ok(connections)
++    }
++}
+diff --git a/crates/infrastructure/src/visa/mod.rs b/crates/infrastructure/src/visa/mod.rs
+index 08d3f22..3c5e615 100644
+--- a/crates/infrastructure/src/visa/mod.rs
++++ b/crates/infrastructure/src/visa/mod.rs
+@@ -14,12 +14,15 @@
+ //! - `library`    — locates and dynamically loads a VISA shared library.
+ //! - `session`    — safe wrapper around a VISA resource-manager session.
+ //! - `idn`        — parses `*IDN?` responses into vendor/model/serial/firmware.
+-//! - `discovery_backend` — the `InstrumentDiscoveryPort` adapter itself.
++//! - `discovery_backend`  — the `InstrumentDiscoveryPort` adapter (transient sessions).
++//! - `connection_backend` — the `ConnectionManagerPort` adapter (persistent, pooled sessions).
+ 
+ mod bindings;
++mod connection_backend;
+ mod discovery_backend;
+ mod idn;
+ mod library;
+ mod session;
+ 
++pub use connection_backend::VisaConnectionManager;
+ pub use discovery_backend::NiVisaDiscoveryBackend;

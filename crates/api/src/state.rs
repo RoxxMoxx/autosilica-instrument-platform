@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use application::use_cases::connection::{
+    ConnectInstrumentUseCase, DisconnectInstrumentUseCase, ListConnectionsUseCase,
+};
 use application::use_cases::discovery::DiscoverInstrumentsUseCase;
 use application::use_cases::instrument::{
     GetInstrumentUseCase, ListInstrumentsUseCase, RegisterInstrumentUseCase,
@@ -16,4 +19,7 @@ pub struct AppState {
     pub get_instrument: Arc<GetInstrumentUseCase>,
     pub register_instrument: Arc<RegisterInstrumentUseCase>,
     pub discover_instruments: Arc<DiscoverInstrumentsUseCase>,
+    pub connect_instrument: Arc<ConnectInstrumentUseCase>,
+    pub disconnect_instrument: Arc<DisconnectInstrumentUseCase>,
+    pub list_connections: Arc<ListConnectionsUseCase>,
 }

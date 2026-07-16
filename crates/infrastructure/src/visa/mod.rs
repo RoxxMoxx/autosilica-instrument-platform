@@ -14,12 +14,15 @@
 //! - `library`    — locates and dynamically loads a VISA shared library.
 //! - `session`    — safe wrapper around a VISA resource-manager session.
 //! - `idn`        — parses `*IDN?` responses into vendor/model/serial/firmware.
-//! - `discovery_backend` — the `InstrumentDiscoveryPort` adapter itself.
+//! - `discovery_backend`  — the `InstrumentDiscoveryPort` adapter (transient sessions).
+//! - `connection_backend` — the `ConnectionManagerPort` adapter (persistent, pooled sessions).
 
 mod bindings;
+mod connection_backend;
 mod discovery_backend;
 mod idn;
 mod library;
 mod session;
 
+pub use connection_backend::VisaConnectionManager;
 pub use discovery_backend::NiVisaDiscoveryBackend;

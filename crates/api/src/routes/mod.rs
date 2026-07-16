@@ -1,3 +1,4 @@
+mod connections;
 mod discovery;
 mod health;
 mod instruments;
@@ -11,7 +12,9 @@ use crate::state::AppState;
 /// Builds the top-level Axum router, mounting all route groups and
 /// shared middleware.
 pub fn create_router(state: AppState) -> Router {
-    let api_v1 = instruments::routes().merge(discovery::routes());
+    let api_v1 = instruments::routes()
+        .merge(discovery::routes())
+        .merge(connections::routes());
 
     Router::new()
         .merge(health::routes())

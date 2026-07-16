@@ -8,6 +8,7 @@
 //! of persistence, HTTP, configuration or instrument communication.
 //! It must never depend on `application`, `infrastructure` or `api`.
 
+pub mod connection;
 pub mod discovery;
 pub mod entities;
 pub mod errors;
